@@ -62,10 +62,7 @@ def evaluate(args, model, loader, device, tokenizer, protected_ids_tensor):
                 )
 
                 # ORI MSE loss
-                loss_ori_mse = nn.functional.smooth_l1_loss(
-                    re_transform(value_pred[mask_for_regression]),
-                    re_transform(value_labels[mask_for_regression])
-                )
+                loss_ori_mse = torch.tensor(0.0, device=DEVICE)
 
             else:
                 loss_mse = torch.tensor(0.0, device=device)
@@ -204,10 +201,7 @@ if __name__ == "__main__":
                 )
 
                 """To show how this model work in the ori space."""
-                loss_ori_mse = nn.functional.smooth_l1_loss(
-                    re_transform(value_pred[mask_for_regression]),
-                    re_transform(value_labels[mask_for_regression])
-                )
+                loss_ori_mse = torch.tensor(0.0, device=DEVICE)
                 
             else:
                 loss_mse = torch.tensor(0.0, device=DEVICE, requires_grad=True)
