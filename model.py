@@ -7,13 +7,14 @@ class SinusoidalNumberEmbedding(nn.Module):
     def __init__(self, hidden_dim):
         super().__init__()
         self.inv_freq = 1.0 / (10000 ** (torch.arange(0, hidden_dim, 2).float() / hidden_dim))
+        self.proj = nn.Linear(hidden_dim, hidden_dim) 
         
     def forward(self, x):
         sinusoid_inp = torch.ger(x.view(-1), self.inv_freq.to(x.device))
         sinusoid_inp = sinusoid_inp.view(x.shape[0], x.shape[1], -1)
         
         pos_emb = torch.cat([sinusoid_inp.sin(), sinusoid_inp.cos()], dim=-1)
-        return pos_emb
+        return self.proj(pos_emb)
     
 class LogIntegralHead(nn.Module):
     def __init__(self, hidden_dim, num_bins=2000, min_val=1e-3, max_safe_val=1e8):
