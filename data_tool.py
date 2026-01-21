@@ -1,7 +1,6 @@
 import torch
 import random
 import datasets
-import numpy as np
 from tqdm import tqdm
 from functools import partial
 from torch.utils.data import DataLoader

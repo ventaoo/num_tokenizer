@@ -7,7 +7,8 @@ import torch
 import matplotlib.pyplot as plt
 
 class ModelCheckpointer:
-    def __init__(self, prefix="model", max_saved=5):
+    def __init__(self, output_dir, prefix="model", max_saved=5):
+        self.output_dir = output_dir
         self.prefix = prefix
         self.max_saved = max_saved
         self.best_val_loss = float('inf')
@@ -19,7 +20,7 @@ class ModelCheckpointer:
         :param step: 当前的全局步数 (global_step)
         :param epoch: 当前的 epoch (可选，用于记录元数据)
         """
-        checkpoint_path = f"{self.prefix}_step_{step}.pth"
+        checkpoint_path = os.path.join(self.output_dir, f"{self.prefix}_step_{step}.pth")
         
         save_dict = {
             'step': step,
@@ -46,7 +47,7 @@ class ModelCheckpointer:
     
     def _cleanup_old_checkpoints(self):
         """清理旧的检查点"""
-        checkpoint_files = glob.glob(f"{self.prefix}_step_*.pth")
+        checkpoint_files = glob.glob(os.path.join(self.output_dir, f"{self.prefix}_step_*.pth"))
         
         if len(checkpoint_files) <= self.max_saved:
             return

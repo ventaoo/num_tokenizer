@@ -9,7 +9,8 @@ import torch.optim as optim
 from transformers import AutoTokenizer, AutoModel
 
 from model import SvgBert
-from data_tool import prepare_data, re_transform
+from tool import re_transform
+from data_tool import prepare_data
 from vis_tool import ModelCheckpointer, plot_compare_curves
 
 def evaluate(args, model, loader, device, tokenizer, protected_ids_tensor):
@@ -55,13 +56,13 @@ def evaluate(args, model, loader, device, tokenizer, protected_ids_tensor):
 
             mask_for_regression = masked_indices & (is_number > 0.5)
             if mask_for_regression.any():
-                loss_mse = nn.functional.mse_loss(
+                loss_mse = nn.functional.smooth_l1_loss(
                     value_pred[mask_for_regression],
                     value_labels[mask_for_regression]
                 )
 
                 # ORI MSE loss
-                loss_ori_mse = nn.functional.mse_loss(
+                loss_ori_mse = nn.functional.smooth_l1_loss(
                     re_transform(value_pred[mask_for_regression]),
                     re_transform(value_labels[mask_for_regression])
                 )
@@ -93,7 +94,7 @@ def get_args():
     # --- 模型与路径配置 ---
     parser.add_argument("--base_model", type=str, default="answerdotai/ModernBERT-base", help="预训练模型名称或路径")
     parser.add_argument("--output_dir", type=str, default="./checkpoints", help="模型保存路径")
-    parser.add_argument("--model_prefix", type=str, default="svgbert_epoch_", help="保存模型的文件名前缀")
+    parser.add_argument("--model_prefix", type=str, default="svgbert", help="保存模型的文件名前缀")
     parser.add_argument("--max_saved", type=int, default=3, help="最多保留几个最新的 Checkpoint")
     parser.add_argument("--mse_weight", type=float, default=20.0, help="MSE loss 权重")
     
@@ -110,7 +111,7 @@ if __name__ == "__main__":
     args = get_args()
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     GRAD_ACCUM_STEPS = max(1, args.target_batch_size // args.batch_size)
-    checkpointer = ModelCheckpointer(prefix="svgbert", max_saved=args.max_saved)
+    checkpointer = ModelCheckpointer(output_dir=args.output_dir, prefix=args.model_prefix, max_saved=args.max_saved)
 
     print(f"Device: {DEVICE}")
     print(f"Physical Batch: {args.batch_size} | Accumulation Steps: {GRAD_ACCUM_STEPS} | Effective Batch: {args.target_batch_size}")
@@ -197,13 +198,13 @@ if __name__ == "__main__":
 
             mask_for_regression = masked_indices & (is_number > 0.5)            
             if mask_for_regression.any():
-                loss_mse = nn.functional.mse_loss(
+                loss_mse = nn.functional.smooth_l1_loss(
                     value_pred[mask_for_regression],
                     value_labels[mask_for_regression]
                 )
 
                 """To show how this model work in the ori space."""
-                loss_ori_mse = nn.functional.mse_loss(
+                loss_ori_mse = nn.functional.smooth_l1_loss(
                     re_transform(value_pred[mask_for_regression]),
                     re_transform(value_labels[mask_for_regression])
                 )

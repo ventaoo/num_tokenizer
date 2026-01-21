@@ -1,5 +1,5 @@
+import torch
 import numpy as np
-
 
 def parse_with_types(s):
     if not s:
