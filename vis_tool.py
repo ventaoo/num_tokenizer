@@ -105,7 +105,7 @@ def draw_metric_subplot(ax, train_x, val_x, config):
                 margin = (y_max - y_min) * 0.05
                 ax.set_ylim(y_min - margin, y_max + margin)
 
-def plot_compare_curves(history, plot_configs=None, save_path=None, max_cols=4):
+def plot_compare_curves(history, plot_configs, save_path=None, max_cols=4):
     """
     主绘图函数
     :param history: 包含训练数据的字典
@@ -117,47 +117,6 @@ def plot_compare_curves(history, plot_configs=None, save_path=None, max_cols=4):
     val_x = history.get("val_steps", [])
 
     # 1. 如果没有传入配置，则定义默认配置 (兼容旧代码逻辑)
-    if plot_configs is None:
-        plot_configs = [
-            {
-                'train_data': history.get("train_loss"),
-                'val_data': history.get("val_loss"),
-                'title': "Total Loss",
-                'ylabel': "Loss",
-                'train_color': 'blue',
-                'val_color': 'dodgerblue',
-                'use_log': False # 默认不开启
-            },
-            {
-                'train_data': history.get("train_ce"),
-                'val_data': history.get("val_ce"),
-                'title': "Cross Entropy Loss",
-                'ylabel': "CE Loss",
-                'train_color': 'green',
-                'val_color': 'limegreen',
-                'use_log': False
-            },
-            {
-                'train_data': history.get("train_mse"),
-                'val_data': history.get("val_mse"),
-                'title': "MSE Loss (Transformed)",
-                'ylabel': "MSE Loss",
-                'train_color': 'red',
-                'val_color': 'tomato',
-                'use_log': False
-            },
-            {
-                'train_data': history.get("train_ori_mse"),
-                'val_data': history.get("val_ori_mse"),
-                'title': "ORI MSE Loss (Original)",
-                'ylabel': "MSE Loss",
-                'train_color': 'purple',
-                'val_color': 'violet',
-                'use_log': False
-            }
-        ]
-        # 过滤掉数据为空的配置，防止报错
-        plot_configs = [c for c in plot_configs if c['train_data'] is not None]
 
     num_plots = len(plot_configs)
     if num_plots == 0:
