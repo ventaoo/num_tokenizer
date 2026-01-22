@@ -63,7 +63,7 @@ class SinusoidalNumberEmbedding(nn.Module):
         return self.proj(pos_emb)
     
 class LogIntegralHead(nn.Module):
-    def __init__(self, hidden_dim, num_bins=2000, min_val=1e-3, max_safe_val=1e8):
+    def __init__(self, hidden_dim, num_bins=5000, min_val=1e-4, max_safe_val=1e6):
         super().__init__()
         self.fc = nn.Linear(hidden_dim, num_bins)
         
@@ -87,10 +87,14 @@ class SvgBert(nn.Module):
     def __init__(self, base_model, hidden, vocab_size):
         super().__init__()
         self.bert = base_model
-        self.token_head = nn.Linear(hidden, vocab_size)  # CE по токенам
-        
-        self.value_head = LogIntegralHead(hidden)  # Регрессия по числам
         self.num_input_proj = SinusoidalNumberEmbedding(hidden)
+        
+        self.token_head = nn.Linear(hidden, vocab_size)  # CE по токенам
+
+        self.value_head = LogIntegralHead(hidden)  # Регрессия по числам
+        self.value_head_offset = nn.Linear(hidden, 1)
+        nn.init.constant_(self.value_head_offset.weight, 0)
+        nn.init.constant_(self.value_head_offset.bias, 0)
 
     def forward(self, input_ids, attention_mask, num_values, is_number):
         inputs_embeds = self.bert.get_input_embeddings()(input_ids)
@@ -103,5 +107,6 @@ class SvgBert(nn.Module):
 
         token_logits = self.token_head(h)               # [B,L,V]
         value_logits, value_pred = self.value_head(h)  # [B,L,num_bins], [B,L]
+        offset_pred = self.value_head_offset(h).squeeze(-1)
 
-        return token_logits, value_pred, value_logits
+        return token_logits, value_pred + offset_pred, value_logits

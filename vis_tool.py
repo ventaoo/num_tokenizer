@@ -13,22 +13,28 @@ class ModelCheckpointer:
         self.prefix = prefix
         self.max_saved = max_saved
         self.best_val_loss = float('inf')
-        self.best_model_path = None
         
-    def save_checkpoint(self, model, step, epoch, val_loss=None, is_best=False):
+    def save_checkpoint(self, model, optimizer, step, epoch, val_loss=None, is_best=False, scheduler=None):
         """
-        保存检查点 (按 Step)
-        :param step: 当前的全局步数 (global_step)
-        :param epoch: 当前的 epoch (可选，用于记录元数据)
+        [修改] 增加了 optimizer 和 scheduler 参数
         """
         checkpoint_path = os.path.join(self.output_dir, f"{self.prefix}_step_{step}.pth")
         
+        if val_loss is not None and val_loss < self.best_val_loss:
+            self.best_val_loss = val_loss
+
         save_dict = {
             'step': step,
             'epoch': epoch,
             'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(), # [新增] 保存优化器状态
             'val_loss': val_loss,
+            'best_val_loss': self.best_val_loss, # [新增] 记录截止目前的历史最佳 Loss (用于恢复)
         }
+        
+        # [新增] 如果有学习率调度器，也保存
+        if scheduler is not None:
+            save_dict['scheduler_state_dict'] = scheduler.state_dict()
         
         torch.save(save_dict, checkpoint_path)
         
@@ -38,13 +44,41 @@ class ModelCheckpointer:
         if is_best and val_loss is not None:
             best_path = os.path.join(self.output_dir, f"{self.prefix}_best.pth")
             torch.save(save_dict, best_path)
-            
-            if val_loss < self.best_val_loss:
-                self.best_val_loss = val_loss
-                self.best_model_path = best_path
-                print(f"🎉 New best model => val_loss: {val_loss:.4f}")
+            print(f"🎉 New best model updated => val_loss: {val_loss:.4f}")
         
         self._cleanup_old_checkpoints()
+
+    def load_checkpoint(self, checkpoint_path, model, optimizer=None, scheduler=None):
+        """
+        [新增] 加载检查点用于恢复训练
+        """
+        if not os.path.exists(checkpoint_path):
+            raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+            
+        print(f"正在加载检查点: {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+        
+        # 1. 恢复模型权重
+        model.load_state_dict(checkpoint['model_state_dict'])
+        
+        # 2. 恢复优化器状态 (如果是恢复训练，这步很关键)
+        if optimizer and 'optimizer_state_dict' in checkpoint:
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            
+        # 3. 恢复调度器 (如果有)
+        if scheduler and 'scheduler_state_dict' in checkpoint:
+            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        
+        # 4. best loss
+        saved_best = checkpoint.get('best_val_loss', float('inf'))
+        if saved_best < self.best_val_loss:
+            self.best_val_loss = saved_best
+            
+        start_epoch = checkpoint.get('epoch', 0)
+        global_step = checkpoint.get('step', 0)
+        
+        print(f"恢复成功! 从 Epoch {start_epoch}, Step {global_step} 开始")
+        return start_epoch, global_step
     
     def _cleanup_old_checkpoints(self):
         """清理旧的检查点"""

@@ -1,6 +1,8 @@
 """
 train.py => train model [svgbert]
 """
+import os
+import json
 import torch
 import argparse
 from tqdm import tqdm
@@ -98,6 +100,7 @@ def get_args():
     parser.add_argument("--model_prefix", type=str, default="svgbert", help="保存模型的文件名前缀")
     parser.add_argument("--max_saved", type=int, default=2, help="最多保留几个最新的 Checkpoint")
     parser.add_argument("--mse_weight", type=float, default=1.0, help="MSE loss 权重")
+    parser.add_argument("--resume_from", type=str, default=None, help="从指定的 checkpoint路径 恢复训练")
     
     # --- 数据路径 (建议添加，方便 Docker 挂载) ---
     parser.add_argument("--data_path", type=str, default="VectorGraphics/svg-corpus-private", help="数据集所在的文件夹路径")
@@ -105,6 +108,16 @@ def get_args():
 
     # 2. 解析参数
     args = parser.parse_args()
+    
+    # 3. save args
+    os.makedirs(args.output_dir, exist_ok=True)
+    config_path = os.path.join(args.output_dir, "config.json")
+    with open(config_path, 'w', encoding='utf-8') as f:
+        json.dump(vars(args), f, indent=2, ensure_ascii=False)
+    
+    print(f"配置已保存到: {config_path}")
+
+
     return args
 
 
@@ -128,7 +141,7 @@ if __name__ == "__main__":
     model = SvgBert(bert_base, bert_base.config.hidden_size, len(tokenizer))
     model.to(DEVICE)
     
-    dist_criterion = LogDistributionLoss(model.value_head, sigma=2.0) 
+    dist_criterion = LogDistributionLoss(model.value_head, sigma=1.0) 
     
     optimizer = optim.AdamW(model.parameters(), lr=args.lr)
     
@@ -158,9 +171,20 @@ if __name__ == "__main__":
     
     # 定义验证频率 (例如：每个 epoch 验证 5 次)
     eval_interval = max(1, total_steps_per_epoch // 5) 
+    
+    # --- [新增] 恢复训练逻辑 ---
+    start_epoch = 0
     global_step = 0
+    if args.resume_from:
+        # 加载权重、优化器状态，并更新开始的 epoch 和 step
+        start_epoch, global_step = checkpointer.load_checkpoint(
+            args.resume_from, 
+            model, 
+            optimizer
+        )
 
-    for epoch in range(args.epochs):
+
+    for epoch in range(start_epoch, args.epochs):
         model.train()
         train_stats = {"loss": 0, "ce": 0, "mse": 0, "steps": 0} # 临时统计容器
         
@@ -249,8 +273,9 @@ if __name__ == "__main__":
                 # 6. 保存模型 (合并在一起，逻辑更顺)
                 checkpointer.save_checkpoint(
                     model=model,
+                    optimizer=optimizer,
                     step=global_step, 
-                    epoch=epoch + 1, 
+                    epoch=epoch, 
                     val_loss=val_avg_loss,
                     is_best=val_avg_loss < checkpointer.best_val_loss
                 )
