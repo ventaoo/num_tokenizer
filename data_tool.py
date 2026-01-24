@@ -16,7 +16,13 @@ def encode_svg(example, max_len=2048, tokenizer=None):
     ]
 
     outputs = {
-        "input_ids": [], "is_number": [], "num_values": [], "attention_mask": []
+        "input_ids": [], 
+        "is_number": [], 
+        "num_values": [], 
+        # [ADD]
+        "mantissa": [], 
+        "exponent": [], 
+        "attention_mask": []
     }
 
     filename = example.get('filename', 'unknown')
@@ -41,6 +47,9 @@ def encode_svg_batched(examples, max_len=2048, tokenizer=None):
         "input_ids": [],
         "is_number": [],
         "num_values": [],
+        # [ADD]
+        "mantissa": [],
+        "exponent": [], 
         "attention_mask": []
     }
     
@@ -56,6 +65,9 @@ def encode_svg_batched(examples, max_len=2048, tokenizer=None):
         batch_outputs['is_number'].append(single_output.get('is_number', []))
         batch_outputs['num_values'].append(single_output.get('num_values', []))
         batch_outputs['attention_mask'].append(single_output.get('attention_mask', []))
+        # [ADD]
+        batch_outputs['mantissa'].append(single_output.get('mantissa', []))
+        batch_outputs['exponent'].append(single_output.get('exponent', []))
     
     return batch_outputs
 
@@ -64,12 +76,18 @@ def collate_fn(batch, tokenizer):
     input_ids_tensors = [torch.tensor(item["input_ids"], dtype=torch.long) for item in batch]
     is_number_tensors = [torch.tensor(item["is_number"], dtype=torch.float) for item in batch]
     num_values_tensors = [torch.tensor(item["num_values"], dtype=torch.float) for item in batch]
+    # [ADD]
+    mantissa_tensors = [torch.tensor(item["mantissa"], dtype=torch.float) for item in batch]
+    exponent_tensors = [torch.tensor(item["exponent"], dtype=torch.long) for item in batch]
     attention_mask_tensors = [torch.tensor(item["attention_mask"], dtype=torch.long) for item in batch]
 
     return {
         "input_ids": pad_sequence(input_ids_tensors, batch_first=True, padding_value=tokenizer.pad_token_id),
         "is_number": pad_sequence(is_number_tensors, batch_first=True, padding_value=0.0),
         "num_values": pad_sequence(num_values_tensors, batch_first=True, padding_value=0.0),
+        # [ADD]
+        "mantissa": pad_sequence(mantissa_tensors, batch_first=True, padding_value=0.0),
+        "exponent": pad_sequence(exponent_tensors, batch_first=True, padding_value=0), 
         "attention_mask": pad_sequence(attention_mask_tensors, batch_first=True, padding_value=0)
     }
 
@@ -87,11 +105,18 @@ def load_data_in_server(data_path, size=100):
     return ds
 
 def prepare_data(args, tokenizer):
-    print("Loading Dataset...")
-    ds = datasets.load_dataset('VectorGraphics/svg-corpus-private', 'svg_viewer_dataset', split='train')
-    # ds = load_data_in_server(args.data_path, args.data_size) # ⚠️ 服务器上的训练
+    ds_list = []
+    for config_name in args.data_configs:
+        print(f"Loading Dataset... {config_name}")
+        ds = datasets.load_dataset(args.data_path, config_name, split="train")
+        ds_list.append(ds)
+    if not ds_list:
+        raise ValueError("没有成功加载任何数据集！")
+    full_dataset = datasets.concatenate_datasets(ds_list)
+    # full_dataset = full_dataset.select(range(500)) # For debug purpose
+    print(f"🚀 合并完成，总样本数: {len(full_dataset)}")
 
-    split_ds = ds.train_test_split(test_size=min(10000, len(ds) // 10), seed=42, shuffle=True)
+    split_ds = full_dataset.train_test_split(test_size=min(10000, len(full_dataset) // 10), seed=42, shuffle=True)
     print(f"Data Split: Train={len(split_ds['train'])}, Val={len(split_ds['test'])}")
 
     process_with_config = partial(

@@ -8,91 +8,125 @@ import argparse
 from tqdm import tqdm
 import torch.nn as nn
 import torch.optim as optim
-from transformers import AutoTokenizer, AutoModel
+import torch.nn.functional as F
+from transformers import AutoTokenizer, ModernBertModel, ModernBertConfig, get_linear_schedule_with_warmup
 
-from model import SvgBert, LogDistributionLoss
+from model import SvgBert
 from data_tool import prepare_data
 from vis_tool import ModelCheckpointer, plot_compare_curves
 
-def evaluate(args, model, loader, device, tokenizer, protected_ids_tensor, dist_criterion):
-    model.eval() # 切换到评估模式
+def get_sign_labels(mantissa_tensor):
+    sign_labels = torch.ones_like(mantissa_tensor, dtype=torch.long) # 默认为 1 (Zero)
+    sign_labels[mantissa_tensor < -1e-9] = 0 # Negative
+    sign_labels[mantissa_tensor > 1e-9] = 2  # Positive
+    return sign_labels
+
+
+def evaluate(args, model, loader, device, tokenizer, protected_ids_tensor):
+    model.eval()
     
-    # 初始化统计器
     total_loss = 0
     total_ce = 0
-    total_mse = 0
+    total_mant = 0 # [CHANGE] 改名 mse -> mant
+    total_exp = 0  # [ADD] 指数 loss
+    total_sign = 0 # [ADD] 符号 loss
     steps = 0
     
     MASK_ID = tokenizer.mask_token_id
     
     with torch.no_grad():
         for batch in tqdm(loader, desc="Validating", leave=False):
-            # 1. 数据加载
             input_ids = batch['input_ids'].to(device)
             is_number = batch['is_number'].to(device)
-            num_values = batch['num_values'].to(device)
+            num_values = batch['num_values'].to(device) # [CHANGE] 需要用到
+            
+            mantissa_labels = batch['mantissa'].to(device)
+            exponent_labels = batch['exponent'].to(device)
             attention_mask = batch['attention_mask'].to(device)
 
-            # 2. 准备标签
+            # --- 1. 准备 Target (Label) ---
             labels = input_ids.clone()
-            value_labels = num_values.clone()
-
-            # 3. 生成 Mask (动态 Mask)
-            # 注意：在验证集上做随机 Mask 是为了计算 MLM Loss。
-            # 虽然这会导致每次验证的 Loss 有微小波动，但在样本量足够大时是可以接受的。
-            # 如果追求严格一致性，可以在验证开始前设置固定的随机种子。
-            probability_matrix = torch.full(input_ids.shape, 0.3, device=device)
             
-            # 排除特殊 Token
-            current_protected_mask = torch.isin(input_ids, protected_ids_tensor)
-            probability_matrix.masked_fill_(current_protected_mask, value=0.0)
+            # [ADD] 生成符号标签 (0:负, 1:零, 2:正)
+            sign_targets = get_sign_labels(mantissa_labels)
             
-            # 生成 Mask 索引
-            masked_indices = torch.bernoulli(probability_matrix).bool()
+            # [ADD] 底数回归的目标必须是绝对值
+            mantissa_targets_abs = torch.abs(mantissa_labels) 
+            
+            exponent_targets = exponent_labels.clone()
 
-            # 应用 Mask
+            # --- 2. Masking Input ---
+            prob_matrix = torch.full(input_ids.shape, 0.3, device=device)
+            prob_matrix.masked_fill_(torch.isin(input_ids, protected_ids_tensor), 0.0)
+            masked_indices = torch.bernoulli(prob_matrix).bool()
+
             input_ids[masked_indices] = MASK_ID
-            num_values[masked_indices] = 0.0
-            labels[~masked_indices] = -100 # CE Loss 忽略非 Mask 部分
-
-            # 4. 模型前向传播
-            token_logits, value_pred, value_logits = model(input_ids, attention_mask, num_values, is_number)
-
-            # 5. 计算 Loss
-            # --- Loss Calculation ---
-            loss_ce = nn.functional.cross_entropy(token_logits.view(-1, len(tokenizer)), labels.view(-1), ignore_index=-100)
             
-            # --- MSE Loss for masked numbers ---
-            mask_reg = masked_indices & (is_number > 0.5)
-            loss_mse = nn.functional.smooth_l1_loss(value_pred[mask_reg], value_labels[mask_reg]) if mask_reg.any() else torch.tensor(0.0, device=DEVICE, requires_grad=True)
-
-            # --- Log Distribution Loss for numbers ---
-            mask_float = is_number.float() * masked_indices.float()
-            loss_dist = dist_criterion(value_logits, num_values, mask_float)
-
-            # 总 Loss
-            loss = loss_ce + args.mse_weight * loss_mse + loss_dist
+            # [IMPORTANT] 输入给模型的数值在 Mask 位置必须清零，否则模型就直接看到答案了
+            num_values[masked_indices] = 0.0 
             
-            # 6. 累积统计
+            labels[~masked_indices] = -100 # Token Loss 忽略非 Mask 区域
+
+            # --- 3. Forward (接收4个返回值) ---
+            # [CHANGE] 解包 token, mantissa, exponent, sign
+            token_logits, pred_mantissa_abs, exp_logits, sign_logits = model(input_ids, attention_mask, num_values, is_number)
+
+            # --- 4. Loss Calculation ---
+            
+            # A. Token Cross Entropy
+            loss_ce = F.cross_entropy(token_logits.view(-1, len(tokenizer)), labels.view(-1), ignore_index=-100)
+            
+            # 筛选出被 Mask 的数值区域
+            mask_num = masked_indices & (is_number > 0.5)
+            
+            if mask_num.any():
+                # B. Sign Classification Loss (符号分类) [ADD]
+                # 展平以便计算 CE
+                loss_sign = F.cross_entropy(sign_logits[mask_num], sign_targets[mask_num])
+                
+                # C. Numerical Losses (仅针对 非零 数字计算 Mantissa 和 Exponent) [ADD]
+                # 零没有底数和指数的概念，或者由符号头处理
+                non_zero_mask = mask_num & (sign_targets != 1) 
+                
+                if non_zero_mask.any():
+                    # Mantissa Regression (Absolute Value)
+                    loss_mant = F.smooth_l1_loss(pred_mantissa_abs[non_zero_mask], mantissa_targets_abs[non_zero_mask])
+                    
+                    # Exponent Distribution (KL Div)
+                    soft_targets = model.value_head.get_soft_labels(exponent_targets[non_zero_mask])
+                    pred_exp_log_probs = F.log_softmax(exp_logits[non_zero_mask], dim=-1)
+                    loss_exp = F.kl_div(pred_exp_log_probs, soft_targets, reduction='batchmean')
+                else:
+                    loss_mant = torch.tensor(0.0, device=device)
+                    loss_exp = torch.tensor(0.0, device=device)
+            else:
+                loss_sign = torch.tensor(0.0, device=device)
+                loss_mant = torch.tensor(0.0, device=device)
+                loss_exp = torch.tensor(0.0, device=device)
+
+            # 总 Loss (权重可调整)
+            loss = loss_ce + loss_sign + loss_mant + loss_exp
+
             total_loss += loss.item()
             total_ce += loss_ce.item()
-            total_mse += loss_mse.item()
+            total_mant += loss_mant.item()
+            total_exp += loss_exp.item()
+            total_sign += loss_sign.item()
             steps += 1
 
-    # 切回训练模式 (可选，建议保留以防外层忘记切换)
     model.train()
-    
-    # 返回平均值 (只返回3个)
-    return total_loss / steps, total_ce / steps, total_mse / steps
+    # [CHANGE] 返回更多指标
+    return total_loss/steps, total_ce/steps, total_mant/steps, total_exp/steps, total_sign/steps
 
 def get_args():
     parser = argparse.ArgumentParser(description="ModernBERT Training Script")
 
     # --- 训练超参数 ---
     parser.add_argument("--lr", type=float, default=1e-4, help="学习率 (Learning Rate)")
-    parser.add_argument("--epochs", type=int, default=10, help="训练轮数")
+    parser.add_argument("--epochs", type=int, default=1, help="训练轮数")
     parser.add_argument("--batch_size", type=int, default=4, help="物理 Batch Size (显存限制)")
     parser.add_argument("--target_batch_size", type=int, default=64, help="目标累积 Batch Size")
+    parser.add_argument("--val_freq", type=int, default=10, help="模型一个epoch验证的次数")
     
     # --- 模型与路径配置 ---
     parser.add_argument("--base_model", type=str, default="answerdotai/ModernBERT-base", help="预训练模型名称或路径")
@@ -103,8 +137,12 @@ def get_args():
     parser.add_argument("--resume_from", type=str, default=None, help="从指定的 checkpoint路径 恢复训练")
     
     # --- 数据路径 (建议添加，方便 Docker 挂载) ---
-    parser.add_argument("--data_path", type=str, default="VectorGraphics/svg-corpus-private", help="数据集所在的文件夹路径")
-    parser.add_argument("--data_size", type=int, default=10, help="抽取多少个数据块")
+    parser.add_argument("--data_path", type=str, default="VectorGraphics/svg-bert-data", help="数据集所在的文件夹路径")
+    parser.add_argument("--data_configs", 
+                   type=str, 
+                   nargs='+', 
+                   default=['FIGR-8', 'OmniSVG__MMSVG-Icon', 'OmniSVG__MMSVG-Illustration', 'freesvg', 'nyuuzyou__clker-svg', 'nyuuzyou__svgfind', 'starvector__svg-fonts', 'starvector_svg-stack', 'svgicons', 'svgrepo'],
+                   help="使用的数据集配置列表")
 
     # 2. 解析参数
     args = parser.parse_args()
@@ -135,42 +173,57 @@ if __name__ == "__main__":
     tokenizer = AutoTokenizer.from_pretrained(args.base_model)
     tokenizer.add_special_tokens({"additional_special_tokens": ["[NUM]"]})
 
-    bert_base = AutoModel.from_pretrained(args.base_model)
+    bert_base_config = ModernBertConfig.from_pretrained(args.base_model)
+    bert_base = ModernBertModel(bert_base_config) # 从头初始化 [FIXED]
     bert_base.resize_token_embeddings(len(tokenizer))
     
     model = SvgBert(bert_base, bert_base.config.hidden_size, len(tokenizer))
     model.to(DEVICE)
-    
-    dist_criterion = LogDistributionLoss(model.value_head, sigma=1.0) 
-    
-    optimizer = optim.AdamW(model.parameters(), lr=args.lr)
+    print("Model initialized successfully.")
     
     # --- 2. 准备数据 ---
     train_loader, val_loader = prepare_data(args, tokenizer)
     total_steps_per_epoch = len(train_loader)
-    
+
+    # --- 3. 优化器 ---
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr)
+
+    # --- 4. 学习率调度器 ---
+    steps_per_epoch = len(train_loader) // GRAD_ACCUM_STEPS
+    total_training_steps = steps_per_epoch * args.epochs
+    warmup_ratio = 0.1 # ⚠️ 当前任务似乎不太需要太多的预热，如果是从头训练可以考虑更大比例
+    num_warmup_steps = int(total_training_steps * warmup_ratio)
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=num_warmup_steps,
+        num_training_steps=total_training_steps
+    )
+    print(f"Scheduler set: {num_warmup_steps} warmup steps over {total_training_steps} total steps.")
+
+
     # 定义特殊 Token (用于 Mask 逻辑)
     MASK_ID = tokenizer.mask_token_id
     protected_ids = {tokenizer.cls_token_id, tokenizer.sep_token_id, tokenizer.pad_token_id, tokenizer.unk_token_id, MASK_ID}
     protected_ids_tensor = torch.tensor([tid for tid in protected_ids if tid is not None], device=DEVICE)
 
-    # --- 3. 训练记录初始化 (已移除 ori_mse) ---
     history = {
-        "train_loss": [], "train_ce": [], "train_mse": [], "train_steps": [],
-        "val_loss": [],   "val_ce": [],   "val_mse": [],   "val_steps": []
+        "train_loss": [], "train_ce": [], "train_mant": [], "train_exp": [], "train_sign": [], "train_steps": [],
+        "val_loss": [],   "val_ce": [],   "val_mant": [],   "val_exp": [],   "val_sign": [], "val_steps": []
     }
     
-    # 绘图配置 (适配上一轮提供的 plot_compare_curves 函数)
+    # [CHANGE] 更新绘图配置
     plot_configs = [
-        {'train_data': history["train_loss"], 'val_data': history["val_loss"], 'title': "Total Loss", 'ylabel': "Loss", 'train_color': 'blue', 'val_color': 'dodgerblue', 'use_log': True},
-        {'train_data': history["train_ce"],   'val_data': history["val_ce"],   'title': "CE Loss",    'ylabel': "CE",   'train_color': 'green', 'val_color': 'limegreen'},
-        {'train_data': history["train_mse"],  'val_data': history["val_mse"],  'title': "MSE Loss",   'ylabel': "MSE",  'train_color': 'red',   'val_color': 'tomato', 'use_log': True}
+        {'train_data': history["train_loss"], 'val_data': history["val_loss"], 'title': "Total Loss", 'ylabel': "Loss", 'train_color': 'blue', 'val_color': 'dodgerblue'},
+        {'train_data': history["train_ce"],   'val_data': history["val_ce"],   'title': "Token CE",   'ylabel': "CE",   'train_color': 'green', 'val_color': 'limegreen'},
+        {'train_data': history["train_mant"], 'val_data': history["val_mant"], 'title': "Mantissa L1", 'ylabel': "L1",  'train_color': 'red',   'val_color': 'tomato'},
+        {'train_data': history["train_sign"], 'val_data': history["val_sign"], 'title': "Sign CE",     'ylabel': "CE",  'train_color': 'purple','val_color': 'violet'},
+        {'train_data': history["train_exp"],  'val_data': history["val_exp"],  'title': "Exp KL",      'ylabel': "KL",  'train_color': 'orange','val_color': 'gold'},
     ]
 
     print("Start Training...")
     
-    # 定义验证频率 (例如：每个 epoch 验证 5 次)
-    eval_interval = max(1, total_steps_per_epoch // 5) 
+    # 定义验证频率 (例如：每个 epoch 验证 10 次)
+    eval_interval = max(1, total_steps_per_epoch // args.val_freq) 
     
     # --- [新增] 恢复训练逻辑 ---
     start_epoch = 0
@@ -180,108 +233,154 @@ if __name__ == "__main__":
         start_epoch, global_step = checkpointer.load_checkpoint(
             args.resume_from, 
             model, 
-            optimizer
+            optimizer,
+            scheduler=scheduler
         )
 
 
     for epoch in range(start_epoch, args.epochs):
         model.train()
-        train_stats = {"loss": 0, "ce": 0, "mse": 0, "steps": 0} # 临时统计容器
+        # [CHANGE] 更新统计字典
+        train_stats = {"loss": 0, "ce": 0, "mant": 0, "exp": 0, "sign": 0, "steps": 0} 
         
         loop = tqdm(train_loader, desc=f'Epoch {epoch+1}/{args.epochs}')
         
         for step, batch in enumerate(loop):
             global_step += 1
             
-            # --- 数据准备 ---
             input_ids = batch['input_ids'].to(DEVICE)
             is_number = batch['is_number'].to(DEVICE)
-            num_values = batch['num_values'].to(DEVICE)
+            num_values = batch['num_values'].to(DEVICE) # [CHANGE] 取出数值
+            
+            mantissa_labels = batch['mantissa'].to(DEVICE)
+            exponent_labels = batch['exponent'].to(DEVICE)
             attention_mask = batch['attention_mask'].to(DEVICE)
 
-            labels = input_ids.clone()
-            value_labels = num_values.clone()
+            if torch.isnan(num_values).any() or torch.isinf(num_values).any():
+                print(f"!!! 检测到坏数据 (num_values) at Step {global_step} !!!")
+                raise ValueError("Input data contains NaN or Inf!")
 
-            # --- Masking 逻辑 (简化写法) ---
+            if torch.isnan(mantissa_labels).any() or torch.isinf(mantissa_labels).any():
+                print(f"!!! 检测到坏数据 (mantissa) at Step {global_step} !!!")
+                raise ValueError("Mantissa labels contain NaN or Inf!")
+
+
+            labels = input_ids.clone()
+            exponent_targets = exponent_labels.clone()
+            
+            # [ADD] 生成符号 Label & 绝对值 Mantissa Target
+            sign_targets = get_sign_labels(mantissa_labels)
+            mantissa_targets_abs = torch.abs(mantissa_labels)
+
+            # --- Masking ---
             prob_matrix = torch.full(input_ids.shape, 0.3, device=DEVICE)
             prob_matrix.masked_fill_(torch.isin(input_ids, protected_ids_tensor), 0.0)
             masked_indices = torch.bernoulli(prob_matrix).bool()
 
             input_ids[masked_indices] = MASK_ID
-            num_values[masked_indices] = 0.0
-            labels[~masked_indices] = -100 # Ignore non-masked tokens in Loss
+            num_values[masked_indices] = 0.0 # [IMPORTANT] 输入必须要 Mask 掉，否则泄露答案
+            labels[~masked_indices] = -100 
 
-            # --- Forward ---
-            token_logits, value_pred, value_logits = model(input_ids, attention_mask, num_values, is_number)
+            # --- Forward (4返回值) ---
+            # [CHANGE]
+            token_logits, pred_mantissa_abs, exp_logits, sign_logits = model(input_ids, attention_mask, num_values, is_number)
 
             # --- Loss Calculation ---
+            # 1. Token Loss
             loss_ce = nn.functional.cross_entropy(token_logits.view(-1, len(tokenizer)), labels.view(-1), ignore_index=-100)
             
-            # --- MSE Loss for masked numbers ---
-            mask_reg = masked_indices & (is_number > 0.5)
-            loss_mse = nn.functional.smooth_l1_loss(value_pred[mask_reg], value_labels[mask_reg]) if mask_reg.any() else torch.tensor(0.0, device=DEVICE, requires_grad=True)
+            # 2. Numerical Losses
+            mask_num = masked_indices & (is_number > 0.5)
+            
+            if mask_num.any():
+                # [ADD] Sign Loss
+                loss_sign = F.cross_entropy(sign_logits[mask_num], sign_targets[mask_num])
+                
+                # [ADD] 仅对非零数字计算数值回归
+                non_zero_mask = mask_num & (sign_targets != 1)
+                
+                if non_zero_mask.any():
+                    # Mantissa (Abs)
+                    loss_mant = F.smooth_l1_loss(pred_mantissa_abs[non_zero_mask], mantissa_targets_abs[non_zero_mask])
+                    
+                    # Exponent (Soft Label KL)
+                    soft_targets = model.value_head.get_soft_labels(exponent_targets[non_zero_mask])
+                    log_probs = F.log_softmax(exp_logits[non_zero_mask], dim=-1)
+                    loss_exp = F.kl_div(log_probs, soft_targets, reduction='batchmean')
+                else:
+                    loss_mant = torch.tensor(0.0, device=DEVICE, requires_grad=True)
+                    loss_exp = torch.tensor(0.0, device=DEVICE, requires_grad=True)
+            else:
+                loss_sign = torch.tensor(0.0, device=DEVICE, requires_grad=True)
+                loss_mant = torch.tensor(0.0, device=DEVICE, requires_grad=True)
+                loss_exp = torch.tensor(0.0, device=DEVICE, requires_grad=True)
 
-            # --- Log Distribution Loss for numbers ---
-            mask_float = is_number.float() * masked_indices.float()
-            loss_dist = dist_criterion(value_logits, num_values, mask_float)
-
-            loss = (loss_ce + args.mse_weight * loss_mse + loss_dist) / GRAD_ACCUM_STEPS
+            # [CHANGE] 加权求和 (可以给 loss_sign 等加权重参数)
+            loss = (loss_ce + loss_sign + args.mse_weight * loss_mant + loss_exp) / GRAD_ACCUM_STEPS
             loss.backward()
 
-            # --- 统计累积 (还原 loss 大小用于显示) ---
+            # --- 统计 ---
             train_stats["loss"] += loss.item() * GRAD_ACCUM_STEPS
             train_stats["ce"] += loss_ce.item()
-            train_stats["mse"] += loss_mse.item()
+            train_stats["mant"] += loss_mant.item() # [CHANGE]
+            train_stats["exp"] += loss_exp.item()   # [CHANGE]
+            train_stats["sign"] += loss_sign.item() # [CHANGE]
             train_stats["steps"] += 1
             
-            # --- Optimizer Step ---
             if global_step % GRAD_ACCUM_STEPS == 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
+                scheduler.step()
                 optimizer.zero_grad()
 
-            loop.set_postfix({'Loss': f"{loss.item()*GRAD_ACCUM_STEPS:.3f}", 'CE': f"{loss_ce.item():.3f}", 'MSE': f"{loss_mse.item():.3f}", "Dist": f"{loss_dist.item():.3f}"})
+            loop.set_postfix({
+                'Loss': f"{loss.item()*GRAD_ACCUM_STEPS:.3f}", 
+                'CE': f"{loss_ce.item():.2f}", 
+                'Sgn': f"{loss_sign.item():.2f}",
+                'Mnt': f"{loss_mant.item():.2f}", 
+                'Exp': f"{loss_exp.item():.2f}"
+            })
 
-            # --- Evaluation & Checkpoint Block (统一处理) ---
+            # --- Evaluation ---
             if (step + 1) % eval_interval == 0 or (step + 1) == total_steps_per_epoch:
-                # 1. 计算当前阶段的平均训练 Loss
                 avg_t = {k: v / train_stats["steps"] for k, v in train_stats.items() if k != "steps"}
                 
-                # 2. 更新训练历史
                 history["train_loss"].append(avg_t["loss"])
                 history["train_ce"].append(avg_t["ce"])
-                history["train_mse"].append(avg_t["mse"])
+                history["train_mant"].append(avg_t["mant"]) # [CHANGE]
+                history["train_exp"].append(avg_t["exp"])   # [CHANGE]
+                history["train_sign"].append(avg_t["sign"]) # [CHANGE]
                 history["train_steps"].append(global_step)
 
-                # 3. 运行验证集
-                val_metrics = evaluate(args, model, val_loader, DEVICE, tokenizer, protected_ids_tensor, dist_criterion)
-                # 假设 evaluate 返回 (loss, ce, mse) 元组，已去除 ori_mse
-                val_avg_loss, val_avg_ce, val_avg_mse = val_metrics 
+                # [CHANGE] 解包5个返回值
+                val_metrics = evaluate(args, model, val_loader, DEVICE, tokenizer, protected_ids_tensor)
+                v_loss, v_ce, v_mant, v_exp, v_sign = val_metrics 
 
-                # 4. 更新验证历史
-                history["val_loss"].append(val_avg_loss)
-                history["val_ce"].append(val_avg_ce)
-                history["val_mse"].append(val_avg_mse)
+                history["val_loss"].append(v_loss)
+                history["val_ce"].append(v_ce)
+                history["val_mant"].append(v_mant) # [CHANGE]
+                history["val_exp"].append(v_exp)   # [CHANGE]
+                history["val_sign"].append(v_sign) # [CHANGE]
                 history["val_steps"].append(global_step)
 
-                print(f"\nStep {global_step} | Train: {avg_t['loss']:.4f} | Val: {val_avg_loss:.4f}")
+                print(f"\n=== Step {global_step} Evaluation ===")
+                print(f"Train | Loss: {avg_t['loss']:.4f} | CE: {avg_t['ce']:.4f} | Sgn: {avg_t['sign']:.4f} | Mnt: {avg_t['mant']:.4f} | Exp: {avg_t['exp']:.4f}")
+                print(f"Val   | Loss: {v_loss:.4f} | CE: {v_ce:.4f} | Sgn: {v_sign:.4f} | Mnt: {v_mant:.4f} | Exp: {v_exp:.4f}")
+                print("-" * 80)
 
-                # 5. 绘图 (传入上一个问题优化的函数)
-                # 注意：这里我们传入 plot_configs，函数会自动根据 config 数量绘制 3 张图
-                plot_compare_curves(history, plot_configs=plot_configs, save_path="comparison_curves.png")
+                plot_compare_curves(history, plot_configs=plot_configs, save_path="comparison_curves.png", max_cols=5)
 
-                # 6. 保存模型 (合并在一起，逻辑更顺)
                 checkpointer.save_checkpoint(
                     model=model,
                     optimizer=optimizer,
                     step=global_step, 
                     epoch=epoch, 
-                    val_loss=val_avg_loss,
-                    is_best=val_avg_loss < checkpointer.best_val_loss
+                    val_loss=v_loss,
+                    is_best=v_loss < checkpointer.best_val_loss,
+                    scheduler=scheduler
                 )
                 
-                # 7. 重置统计
-                train_stats = {"loss": 0, "ce": 0, "mse": 0, "steps": 0}
-                model.train() # 确保 evaluate 后切回 train 模式
+                train_stats = {"loss": 0, "ce": 0, "mant": 0, "exp": 0, "sign": 0, "steps": 0}
+                model.train()
 
     print("Training Complete.")

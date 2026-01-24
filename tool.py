@@ -1,3 +1,4 @@
+import math
 import torch
 import numpy as np
 
@@ -161,16 +162,53 @@ def apply_transform(x, method="log"):
 def re_transform(x):
     return torch.sign(x) * torch.expm1(torch.abs(x))
 
+def decompose_signed_mantissa(x, eps=1e-12):
+    # [FIX 1] 强制处理 NaN/Inf，防止污染下游
+    if not math.isfinite(x):
+        return 0.0, 0
+    if abs(x) < eps:
+        return 0.0, 0  # 特殊处理零（可选）
+    
+    # [FIX 2] 防止 log10 报错（虽然上面过滤了 0，但为了稳健）
+    try:
+        exp = math.floor(math.log10(abs(x)))
+    except ValueError:
+        return 0.0, 0
+
+    mantissa = x / (10 ** exp)
+    
+    # 确保 |mantissa| ∈ [1, 10)
+    if abs(mantissa) < 1:
+        mantissa *= 10
+        exp -= 1
+    elif abs(mantissa) >= 10:
+        mantissa /= 10
+        exp += 1
+    
+    # [FIX 4] 强制截断 Exponent，适配模型定义的 [-10, 10]
+    exp = max(min(exp, 10), -10)
+    return mantissa, exp
+
 def process_single_svg_str(s, max_len, tokenizer):
-    parsed = parse_with_types_with_auto_check(s)
+    try:
+        parsed = parse_with_types_with_auto_check(s)
+    except Exception as e:
+        print(f"Parse error: {e}")
+        return {} # 返回空或者跳过
+
     num_id = tokenizer.convert_tokens_to_ids("[NUM]")
 
-    ids = []
-    is_num = []
-    values = []
+    # CLS TOKEN
+    ids = [tokenizer.cls_token_id]
+    is_num = [0.0]
+    values = [0.0]
+
+    # [ADD]
+    mantissa = [0.0]
+    exponent = [0]
     
     for v, t, _ in parsed:
-        if len(ids) >= max_len: break
+        if len(ids) >= max_len - 1: break # Leave room for [SEP]
             
         if t == "string":
             toks = tokenizer.tokenize(v)
@@ -179,15 +217,51 @@ def process_single_svg_str(s, max_len, tokenizer):
                 ids.append(tokenizer.convert_tokens_to_ids(tok))
                 is_num.append(0.0)
                 values.append(0.0)
+                # [ADD]
+                mantissa.append(0.0)
+                exponent.append(0)
         else:
             if len(ids) >= max_len: break 
+            # [FIX 5] 安全转换 Float，拦截 NaN/Inf/Overflow
+            try:
+                val_float = float(v)
+                # 检查无穷大或非数值
+                if math.isnan(val_float) or math.isinf(val_float):
+                    val_float = 0.0
+                
+                # [FIX 6] 极端数值截断 (防止 sin(x) 数值不稳定)
+                val_float = max(min(val_float, 1e10), -1e10)
+                
+            except (ValueError, OverflowError):
+                val_float = 0.0
+
             ids.append(num_id)
             is_num.append(1.0)
-            values.append(apply_transform(float(v), method="original")) 
+            
+            value = apply_transform(val_float, method="original")
+            values.append(value) # 采用原始空间的值
+            # [ADD]
+            m, e = decompose_signed_mantissa(value)
+            mantissa.append(m)
+            exponent.append(e)
+            
+
+    # SEP TOKEN
+    ids.append(tokenizer.sep_token_id)
+    is_num.append(0.0)
+    values.append(0.0)
+
+    # [ADD]
+    mantissa.append(0.0)
+    exponent.append(0)
+
+    assert len(ids) == len(values) == len(mantissa) == len(exponent)
 
     return {
         "input_ids": ids,
         "is_number": is_num,
         "num_values": values,
+        "mantissa": mantissa,
+        "exponent": exponent,
         "attention_mask": [1] * len(ids)
     }
