@@ -153,34 +153,3 @@ def prepare_data(args, tokenizer):
     )
     
     return train_loader, val_loader
-
-
-if __name__ == '__main__':
-    # ROOT_DIR = "/data/svg-corpus/"
-    # ds = load_data_in_server(ROOT_DIR, size=100)
-    # ds.cleanup_cache_files() # clean cache
-    # print(f"load dataset: {ds}")
-    # print(ds.info, ds.features)
-    # print(f"Total samples: {len(ds)}")
-
-    import os
-    from dotenv import load_dotenv
-    from transformers import AutoTokenizer
-    
-    load_dotenv()
-    if os.getenv('HF_TOKEN'):
-        from huggingface_hub import login
-        login(token=os.getenv('HF_TOKEN'))
-    ds = datasets.load_dataset('VectorGraphics/svg-corpus-private', 'svg_viewer_dataset', split='train')
-    print(f"load dataset: {ds}")
-
-    tokenizer = AutoTokenizer.from_pretrained("answerdotai/ModernBERT-base")
-    tokenizer.add_special_tokens({"additional_special_tokens": ["[NUM]"]})
-    print(f"Tokenizer initialized successfully.")
-
-    processed_str = process_single_svg_str(ds[0]['raw_svg'][:200], max_len=300, tokenizer=tokenizer)
-    print(ds[0]['raw_svg'][:200])
-    for key, item in processed_str.items():
-        print(f"{key}: {item}\n\n")
-    
-    print(tokenizer.convert_ids_to_tokens(processed_str['input_ids']))

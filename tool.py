@@ -265,3 +265,9 @@ def process_single_svg_str(s, max_len, tokenizer):
         "exponent": exponent,
         "attention_mask": [1] * len(ids)
     }
+
+def get_sign_labels(mantissa_tensor):
+    sign_labels = torch.ones_like(mantissa_tensor, dtype=torch.long) # 默认为 1 (Zero)
+    sign_labels[mantissa_tensor < -1e-9] = 0 # Negative
+    sign_labels[mantissa_tensor > 1e-9] = 2  # Positive
+    return sign_labels

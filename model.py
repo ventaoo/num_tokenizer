@@ -86,19 +86,83 @@ class SoftExponentScientificHead(nn.Module):
         probs = F.softmax(logits, dim=-1)
         
         return probs
+    
+class MultiScaleInputEmbedding(nn.Module):
+    def __init__(self, hidden_dim, scales=[10.0, 1.0, 0.1, 0.01]):
+        """
+        SVG 数值多尺度编码模块
+        :param hidden_dim: 映射到的隐藏层维度 (BERT 的 hidden_size)
+        :param scales: 缩放因子列表。
+                       10.0 负责捕捉小数细节 (0.1 * 10 = 1)
+                       0.01 负责捕捉大数全局 (100 * 0.01 = 1)
+        """
+        super().__init__()
+        # 将 scales 注册为 buffer，这样它会随模型移动到 GPU，且不会被视作训练参数
+        self.register_buffer("scales", torch.tensor(scales, dtype=torch.float32))
+        
+        self.input_dim = len(scales)
+        self.hidden_dim = hidden_dim
+        
+        # 线性投影层：将多尺度特征融合
+        self.proj = nn.Linear(self.input_dim, hidden_dim)
+        self.norm = nn.LayerNorm(hidden_dim)
+
+    def forward(self, x):
+        """
+        :param x: 输入张量，形状可以是 [Batch, SeqLen] 或 [Batch, SeqLen, 1]
+        :return: 嵌入向量 [Batch, SeqLen, hidden_dim]
+        """
+        # 1. 确保输入是数值张量且维度正确 [B, L, 1]
+        if x.dim() == 2:
+            x = x.unsqueeze(-1)
+        x = x.float() # 确保数据类型为 float
+
+        # 2. 多尺度变换
+        # x: [B, L, 1] * scales: [S] -> [B, L, S]
+        multi_scaled_x = x * self.scales
+
+        # 3. 投影到隐藏层维度
+        h = self.proj(multi_scaled_x)
+
+        # 4. 规范化处理
+        return self.norm(h)
+    
+class ValueRegressionHead(nn.Module):
+    def __init__(self, hidden_dim):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 1) 
+        )
+
+    def forward(self, h):
+        """
+        h: [B, L, hidden_dim] Transformer 的输出
+        return: [B, L] 预测的数值（绝对值）
+        """
+        return self.net(h).squeeze(-1)
 
 class SvgBert(nn.Module):
-    def __init__(self, base_model, hidden, vocab_size, min_exp=-10, max_exp=10):
+    def __init__(self, 
+        base_model, 
+        hidden, 
+        vocab_size, 
+        min_exp=-10, 
+        max_exp=10, 
+        is_multi_scale=False,
+        is_regression_only=False
+    ):
         super().__init__()
         self.bert = base_model
-        self.num_input_proj = SinusoidalNumberEmbedding(hidden)
-        
-        self.token_head = nn.Linear(hidden, vocab_size)
-        self.value_head = SoftExponentScientificHead(
+        self.num_input_proj = MultiScaleInputEmbedding(hidden) if is_multi_scale else SinusoidalNumberEmbedding(hidden)
+        self.value_head = ValueRegressionHead(hidden) if is_regression_only else SoftExponentScientificHead(
             hidden, 
             min_exp=min_exp, 
             max_exp=max_exp
         )
+
+        self.token_head = nn.Linear(hidden, vocab_size)
 
     def forward(self, input_ids, attention_mask, num_values, is_number):
         inputs_embeds = self.bert.get_input_embeddings()(input_ids)
@@ -110,7 +174,10 @@ class SvgBert(nn.Module):
         h = out.last_hidden_state  # [B, L, H]
         
         token_logits = self.token_head(h)  # [B, L, V]
-        pred_mantissa_abs, exp_logits, sign_logits = self.value_head(h)
 
-        # 返回 4 个部分：Token预测, 底数绝对值, 指数分布, 符号分布
+        if isinstance(self.value_head, ValueRegressionHead):
+            pred_values = self.value_head(h)  # [B, L]
+            return token_logits, pred_values
+        
+        pred_mantissa_abs, exp_logits, sign_logits = self.value_head(h)
         return token_logits, pred_mantissa_abs, exp_logits, sign_logits
