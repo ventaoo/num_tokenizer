@@ -151,16 +151,36 @@ class SvgBert(nn.Module):
         min_exp=-10, 
         max_exp=10, 
         is_multi_scale=False,
-        is_regression_only=False
+        is_regression_only=False,
+        is_base_line=False
     ):
         super().__init__()
+        self.is_base_line = is_base_line
         self.bert = base_model
-        self.num_input_proj = MultiScaleInputEmbedding(hidden) if is_multi_scale else SinusoidalNumberEmbedding(hidden)
-        self.value_head = ValueRegressionHead(hidden) if is_regression_only else SoftExponentScientificHead(
-            hidden, 
-            min_exp=min_exp, 
-            max_exp=max_exp
-        )
+
+        if is_base_line:
+            """基线模型：之前的服务器上的旧代码，配合对数空间投影"""
+            self.num_input_proj = nn.Sequential(
+                nn.Linear(1, hidden),
+                nn.Tanh()
+            )
+        else:
+            self.num_input_proj = MultiScaleInputEmbedding(hidden) if is_multi_scale else SinusoidalNumberEmbedding(hidden)
+        
+        if is_base_line:
+            """基线模型：之前的服务器上的旧代码，配合对数空间投影"""
+            self.value_head = nn.Sequential(
+                nn.Linear(hidden, hidden * 2),
+                nn.GELU(),
+                nn.Linear(hidden * 2, 1)
+            )
+        else:
+            self.value_head = ValueRegressionHead(hidden) if is_regression_only else SoftExponentScientificHead(
+                hidden, 
+                min_exp=min_exp, 
+                max_exp=max_exp
+            )
+        
 
         self.token_head = nn.Linear(hidden, vocab_size)
 
@@ -174,6 +194,9 @@ class SvgBert(nn.Module):
         h = out.last_hidden_state  # [B, L, H]
         
         token_logits = self.token_head(h)  # [B, L, V]
+
+        if self.is_base_line:
+             return token_logits, self.value_head(h).squeeze(-1)        
 
         if isinstance(self.value_head, ValueRegressionHead):
             pred_values = self.value_head(h)  # [B, L]

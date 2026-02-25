@@ -189,7 +189,7 @@ def decompose_signed_mantissa(x, eps=1e-12):
     exp = max(min(exp, 10), -10)
     return mantissa, exp
 
-def process_single_svg_str(s, max_len, tokenizer):
+def process_single_svg_str(s, max_len, tokenizer, method="original"):
     try:
         parsed = parse_with_types_with_auto_check(s)
     except Exception as e:
@@ -238,7 +238,7 @@ def process_single_svg_str(s, max_len, tokenizer):
             ids.append(num_id)
             is_num.append(1.0)
             
-            value = apply_transform(val_float, method="original")
+            value = apply_transform(val_float, method=method)
             values.append(value) # 采用原始空间的值
             # [ADD]
             m, e = decompose_signed_mantissa(value)

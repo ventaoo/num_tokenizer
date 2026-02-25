@@ -9,7 +9,7 @@ from torch.nn.utils.rnn import pad_sequence
 from tool import process_single_svg_str
 
 
-def encode_svg(example, max_len=2048, tokenizer=None):
+def encode_svg(example, max_len=2048, tokenizer=None, method="original"):
     valid_keys = [
         k for k in ['raw_svg', 'stage1_svg', 'stage2_svg', 'stage2_augmented_svg'] 
         if example.get(k) is not None and str(example.get(k)) != "None" and isinstance(example.get(k), str)
@@ -32,7 +32,7 @@ def encode_svg(example, max_len=2048, tokenizer=None):
     
     key = random.choice(valid_keys)
     try:
-        processed = process_single_svg_str(example.get(key), max_len, tokenizer)
+        processed = process_single_svg_str(example.get(key), max_len, tokenizer, method=method)
         if not processed or len(processed["input_ids"]) == 0:
             return outputs
             
@@ -42,7 +42,7 @@ def encode_svg(example, max_len=2048, tokenizer=None):
 
     return outputs
 
-def encode_svg_batched(examples, max_len=2048, tokenizer=None):
+def encode_svg_batched(examples, max_len=2048, tokenizer=None, method="original"):
     batch_outputs = {
         "input_ids": [],
         "is_number": [],
@@ -59,7 +59,7 @@ def encode_svg_batched(examples, max_len=2048, tokenizer=None):
         # 从批次字典中，为第 i 个样本构建一个单独的 example 字典
         single_example = {key: examples[key][i] for key in examples.keys()}
         
-        single_output = encode_svg(single_example, max_len=max_len, tokenizer=tokenizer)
+        single_output = encode_svg(single_example, max_len=max_len, tokenizer=tokenizer, method=method)
         
         batch_outputs['input_ids'].append(single_output.get('input_ids', []))
         batch_outputs['is_number'].append(single_output.get('is_number', []))
@@ -114,15 +114,24 @@ def prepare_data(args, tokenizer):
         raise ValueError("没有成功加载任何数据集！")
     full_dataset = datasets.concatenate_datasets(ds_list)
     # full_dataset = full_dataset.select(range(500)) # For debug purpose
+
+    # =================== Test with a single dataset ===================
+    # full_dataset = datasets.load_dataset('VectorGraphics/svg-corpus-private', 'svg_viewer_dataset', split='train')
+    # =================== Test with a single dataset ===================
+
     print(f"🚀 合并完成，总样本数: {len(full_dataset)}")
 
     split_ds = full_dataset.train_test_split(test_size=min(10000, len(full_dataset) // 10), seed=42, shuffle=True)
     print(f"Data Split: Train={len(split_ds['train'])}, Val={len(split_ds['test'])}")
 
+
+    method = "log" if args.is_base_line else "original"
+    print(f"Using number transformation method: {method}, is_base_line: {args.is_base_line} 🚀")
     process_with_config = partial(
         encode_svg_batched,
         max_len=2048,
-        tokenizer=tokenizer
+        tokenizer=tokenizer,
+        method=method
     )
 
     # Lazy Loading

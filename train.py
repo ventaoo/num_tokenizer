@@ -18,7 +18,7 @@ from vis_tool import ModelCheckpointer, plot_compare_curves
 def evaluate(args, model, loader, device, tokenizer, protected_ids_tensor):
     model.eval()
     
-    keys = ["loss", "ce", "val_num"] if args.is_regression_only else ["loss", "ce", "mant", "exp", "sign"]
+    keys = ["loss", "ce", "val_num"] if args.is_regression_only or args.is_base_line else ["loss", "ce", "mant", "exp", "sign"]
     total_stats = {k: 0.0 for k in keys}
     steps = 0
     MASK_ID = tokenizer.mask_token_id
@@ -52,7 +52,7 @@ def evaluate(args, model, loader, device, tokenizer, protected_ids_tensor):
             # --- 3. Forward & Loss Calculation ---
             outputs = model(input_ids, attention_mask, input_values, is_number)
 
-            if args.is_regression_only:
+            if args.is_regression_only or args.is_base_line:
                 token_logits, pred_values = outputs
                 
                 # Token Loss
@@ -135,6 +135,7 @@ def get_args():
 
     parser.add_argument("--is_multi_scale", action="store_true", help="是否使用多尺度输入嵌入")
     parser.add_argument("--is_regression_only", action="store_true", help="是否只进行数值回归任务")
+    parser.add_argument("--is_base_line", action="store_true", help="是否使用基线模型")
 
     # --- 数据路径 (建议添加，方便 Docker 挂载) ---
     parser.add_argument("--data_path", type=str, default="VectorGraphics/svg-bert-data", help="数据集所在的文件夹路径")
@@ -177,7 +178,7 @@ if __name__ == "__main__":
     bert_base = ModernBertModel(bert_base_config) # 从头初始化 [FIXED]
     bert_base.resize_token_embeddings(len(tokenizer))
     
-    model = SvgBert(bert_base, bert_base.config.hidden_size, len(tokenizer), is_multi_scale=args.is_multi_scale, is_regression_only=args.is_regression_only)
+    model = SvgBert(bert_base, bert_base.config.hidden_size, len(tokenizer), is_multi_scale=args.is_multi_scale, is_regression_only=args.is_regression_only, is_base_line=args.is_base_line)
     model.to(DEVICE)
     print("Model initialized successfully.")
     
@@ -206,7 +207,7 @@ if __name__ == "__main__":
     protected_ids = {tokenizer.cls_token_id, tokenizer.sep_token_id, tokenizer.pad_token_id, tokenizer.unk_token_id, MASK_ID}
     protected_ids_tensor = torch.tensor([tid for tid in protected_ids if tid is not None], device=DEVICE)
 
-    if args.is_regression_only:
+    if args.is_regression_only or args.is_base_line:
         print("Training in Regression-Only Mode.")
         history = {
             "train_loss": [], "train_ce": [], "train_smooth_l1": [], "train_steps": [],
@@ -252,7 +253,7 @@ if __name__ == "__main__":
     for epoch in range(start_epoch, args.epochs):
         model.train()
         
-        if args.is_regression_only:
+        if args.is_regression_only or args.is_base_line:
             train_stats = {"loss": 0, "ce": 0, "val_num": 0, "steps": 0} 
         else:
             train_stats = {"loss": 0, "ce": 0, "mant": 0, "exp": 0, "sign": 0, "steps": 0}
@@ -289,7 +290,7 @@ if __name__ == "__main__":
             
             # --- Forward & Loss Calculation (根据模式分支) ---
             outputs = model(input_ids, attention_mask, input_values, is_number)
-            if args.is_regression_only:
+            if args.is_regression_only or args.is_base_line:
                 token_logits, pred_values = outputs
                 
                 # 1. Token Loss
@@ -368,7 +369,7 @@ if __name__ == "__main__":
                 history["train_loss"].append(avg_t["loss"])
                 history["train_ce"].append(avg_t["ce"])
 
-                if args.is_regression_only:
+                if args.is_regression_only or args.is_base_line:
                     history["train_smooth_l1"].append(avg_t["val_num"])
                 else:
                     history["train_mant"].append(avg_t["mant"])
@@ -381,7 +382,7 @@ if __name__ == "__main__":
                 history["val_loss"].append(val_metrics["loss"])
                 history["val_ce"].append(val_metrics["ce"])
 
-                if args.is_regression_only:
+                if args.is_regression_only or args.is_base_line:
                     history["val_smooth_l1"].append(val_metrics["val_num"])
                     
                     print(f"\n=== Step {global_step} ===")
@@ -411,7 +412,7 @@ if __name__ == "__main__":
                 )
 
                  # 重置统计
-                if args.is_regression_only:
+                if args.is_regression_only or args.is_base_line:
                     train_stats = {"loss": 0, "ce": 0, "val_num": 0, "steps": 0}
                 else:
                     train_stats = {"loss": 0, "ce": 0, "mant": 0, "exp": 0, "sign": 0, "steps": 0} 
